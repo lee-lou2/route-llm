@@ -1,0 +1,16 @@
+services:
+  route-llm:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ROUTE_LLM_BIND: 0.0.0.0:8080
+      ROUTE_LLM_DATABASE_URL: sqlite:///data/router.sqlite
+      ROUTE_LLM_PUBLIC_PREFIX: /v1
+      ROUTE_LLM_ADMIN_SITE_NAME: Route LLM
+      ROUTE_LLM_ADMIN_SITE_DESCRIPTION: Local OpenAI-compatible routing proxy
+    volumes:
+      - route-llm-data:/data
+
+volumes:
+  route-llm-data:

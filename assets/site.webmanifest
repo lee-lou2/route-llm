@@ -1,0 +1,22 @@
+{
+  "name": "Route LLM",
+  "short_name": "Router",
+  "description": "Local OpenAI-compatible routing proxy",
+  "start_url": "/admin",
+  "display": "standalone",
+  "background_color": "#eef2f7",
+  "theme_color": "#172033",
+  "icons": [
+    {
+      "src": "/apple-touch-icon.png?v=20260616-simple",
+      "sizes": "180x180",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon.svg?v=20260616-simple",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
