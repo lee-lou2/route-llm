@@ -779,7 +779,7 @@ fn disabled_page(config: &AdminConfig) -> (StatusCode, Html<String>) {
         Html(page_shell(
             &page_meta(config),
             "관리자 비활성화",
-            r#"<main class="login"><h1>관리자 비활성화</h1><p><code>ROUTE_LLM_ADMIN_PASSWORD</code>가 필요합니다.</p></main>"#,
+            r#"<main class="login"><h1>관리자 비활성화</h1><p><code>ROUTE_LLM_ADMIN_PASSWORD</code>가 필요합니다. 기존 launchd 설정과의 호환을 위해 <code>API_ROUTER_ADMIN_PASSWORD</code>도 fallback으로 허용됩니다.</p></main>"#,
         )),
     )
 }

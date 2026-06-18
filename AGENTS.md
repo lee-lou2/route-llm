@@ -21,7 +21,8 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
 - Build release service binary: `cargo build --release --bin api-router`
 - Run local container: `docker compose -f docker-compose.local.yml up --build`
 - List routing state: `cargo run -- list`
-- Web admin UI: `/admin` when `ROUTE_LLM_ADMIN_PASSWORD` is set
+- Web admin UI: `/admin` when `ROUTE_LLM_ADMIN_PASSWORD` is set; legacy
+  `API_ROUTER_ADMIN_PASSWORD` is accepted only as a compatibility fallback
 - Add provider/base URL:
   `cargo run -- add-upstream --name <provider> --base-url <url>/v1 --priority <n>`
 - Add provider key:
@@ -204,7 +205,10 @@ Routing behavior:
 
 ## Web Admin UI
 
-- Keep `/admin` password-protected with `ROUTE_LLM_ADMIN_PASSWORD`.
+- Keep `/admin` password-protected with `ROUTE_LLM_ADMIN_PASSWORD`. Preserve
+  legacy `API_ROUTER_ADMIN_PASSWORD` and `API_ROUTER_ADMIN_SESSION_SECRET` as
+  compatibility fallbacks for existing launchd/service configs, but prefer the
+  canonical `ROUTE_LLM_*` names in new docs and examples.
 - Use the UI for day-to-day changes: provider/base URL, upstream keys, upstream
   models, public aliases, client creation, multiple client-token generation, and
   client route access.

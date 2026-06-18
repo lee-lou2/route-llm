@@ -179,8 +179,8 @@ Repeat the same `add-upstream`, `add-key`, `add-model-alias`, and
 | `ROUTE_LLM_TRANSIENT_FAILURE_TTL_SECS` | `300` | retry cache TTL for transient upstream failures |
 | `ROUTE_LLM_AUTH_FAILURE_TTL_SECS` | `3600` | retry cache TTL for upstream auth failures |
 | `ROUTE_LLM_MAX_BODY_BYTES` | `33554432` | maximum request body accepted by the proxy |
-| `ROUTE_LLM_ADMIN_PASSWORD` | unset | enables `/admin` when set |
-| `ROUTE_LLM_ADMIN_SESSION_SECRET` | derived from password | optional stable cookie-signing secret |
+| `ROUTE_LLM_ADMIN_PASSWORD` | unset | enables `/admin` when set; legacy `API_ROUTER_ADMIN_PASSWORD` is accepted as a fallback |
+| `ROUTE_LLM_ADMIN_SESSION_SECRET` | derived from password | optional stable cookie-signing secret; legacy `API_ROUTER_ADMIN_SESSION_SECRET` is accepted as a fallback |
 | `ROUTE_LLM_ADMIN_SITE_NAME` | `Route LLM` | admin UI display name |
 | `ROUTE_LLM_ADMIN_SITE_DESCRIPTION` | `Local OpenAI-compatible routing proxy` | admin page metadata |
 | `ROUTE_LLM_PUBLIC_BASE_URL` | unset | optional display and Open Graph base URL |
