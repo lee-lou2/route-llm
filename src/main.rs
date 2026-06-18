@@ -3,6 +3,7 @@ mod assets;
 mod cli;
 mod db;
 mod http_proxy;
+mod responses_compat;
 mod server;
 
 use anyhow::Context;

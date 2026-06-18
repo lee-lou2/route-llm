@@ -18,6 +18,7 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
 - Lint: `cargo clippy -- -D warnings`
 - Package audit: `cargo package --list --allow-dirty`
 - Run locally: `cargo run -- serve --bind 127.0.0.1:8080`
+- Build release service binary: `cargo build --release --bin api-router`
 - Run local container: `docker compose -f docker-compose.local.yml up --build`
 - List routing state: `cargo run -- list`
 - Web admin UI: `/admin` when `ROUTE_LLM_ADMIN_PASSWORD` is set
@@ -56,6 +57,10 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
   headers, raw API keys, raw user agents, raw query strings, or upstream base
   URLs. Store ids, names, statuses, sizes, timings, date buckets, hashes,
   fingerprints, and numeric token counts instead.
+- Responses compatibility state is not audit data. `response_states` may store
+  conversation history, assistant outputs, and function-call arguments so
+  `previous_response_id` can be replayed for the same client. Treat it as
+  sensitive SQLite runtime state.
 - Do not record admin UI visits or browser artifact requests such as
   `/favicon.ico` in request audits or admin usage statistics.
 - Before publishing or packaging, run `cargo package --list --allow-dirty` and
@@ -64,6 +69,12 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
 ## Implementation Notes
 
 - Preserve OpenAI-compatible `/v1/...` paths and streaming responses.
+- `POST /v1/responses` is a compatibility adapter for upstreams that support
+  `/v1/chat/completions` but not `/v1/responses`. Preserve `input`,
+  `instructions`, function `tools`, `tool_choice`, `previous_response_id`,
+  `output`, `output_text`, `usage`, and Responses SSE events. Do not claim
+  support for OpenAI-hosted built-in tools such as hosted web search or file
+  search unless they are explicitly implemented.
 - For streaming chat/completions-style requests, preserve the stream while
   adding `stream_options.include_usage = true` to JSON request bodies so
   compatible upstreams can emit final usage. Parse only SSE `usage` metadata and
@@ -211,6 +222,8 @@ Routing tests should cover:
 - unknown model pass-through behavior
 - request body model rewrite edge cases
 - streaming `stream_options.include_usage` injection and SSE usage parsing
+- `/v1/responses` JSON conversion, SSE event conversion, function tool calls,
+  and `previous_response_id` state replay
 - `/v1/models` returning public aliases only
 - `/v1/models` returning `max_model_len` for every public alias
 - audit rows recording public model names and date buckets

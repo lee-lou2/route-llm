@@ -25,3 +25,13 @@ Include:
 in SQLite so the proxy and admin UI can use them later. Treat the configured
 SQLite database, WAL files, `.env` files, logs, and backups as private runtime
 state. They must not be committed or attached to public issues.
+
+Request audit rows are sanitized and must not contain prompts, responses, raw
+authorization headers, raw API keys, raw user agents, raw query strings, or
+upstream base URLs.
+
+Responses compatibility state is different from audit data. When
+`/v1/responses` uses `previous_response_id`, the `response_states` table stores
+the chat history needed to continue that response. That state may include user
+input, assistant output, and function-call arguments, so treat it as sensitive
+runtime data.

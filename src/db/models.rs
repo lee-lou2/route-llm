@@ -62,6 +62,20 @@ pub struct RequestAudit {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResponseState {
+    pub id: String,
+    pub previous_response_id: Option<String>,
+    pub client_id: Option<i64>,
+    pub model: String,
+    pub chat_messages_json: String,
+    pub output_json: String,
+    pub output_text: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct AttemptAudit {
     pub attempt_index: i64,
     pub upstream_id: i64,

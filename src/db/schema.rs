@@ -340,6 +340,27 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS response_states (
+            id TEXT PRIMARY KEY,
+            previous_response_id TEXT REFERENCES response_states(id) ON DELETE SET NULL,
+            client_id INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+            model TEXT NOT NULL,
+            chat_messages_json TEXT NOT NULL,
+            output_json TEXT NOT NULL,
+            output_text TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            total_tokens INTEGER,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_clients_auth
             ON clients(api_key_hash, enabled);
         CREATE INDEX IF NOT EXISTS idx_client_tokens_auth
@@ -384,6 +405,10 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
             ON upstream_attempt_audits(request_audit_id, attempt_index);
         CREATE INDEX IF NOT EXISTS idx_attempt_audits_key_completed
             ON upstream_attempt_audits(upstream_key_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_response_states_client_created
+            ON response_states(client_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_response_states_previous
+            ON response_states(previous_response_id);
         "#,
     )
     .execute(pool)

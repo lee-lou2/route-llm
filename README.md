@@ -6,14 +6,19 @@ token while the router forwards requests to one or more OpenAI-compatible
 upstream providers stored in SQLite.
 
 The project is intentionally narrower than a full LLM gateway. It preserves
-OpenAI-style request and response bodies, keeps routing state in SQLite, retries
-healthy upstream keys in priority order, and records sanitized operational audit
-metadata without storing prompts or responses.
+OpenAI-style request and response bodies, keeps routing and optional Responses
+conversation state in SQLite, retries healthy upstream keys in priority order,
+and records sanitized operational audit metadata without storing prompts or
+responses in audit rows.
 
 ## Features
 
-- OpenAI-compatible `/v1/...` proxying for chat, responses, completions,
-  embeddings, image, audio, and other pass-through paths.
+- OpenAI-compatible `/v1/...` proxying for chat, completions, embeddings,
+  image, audio, and other pass-through paths.
+- Responses API compatibility for chat-completions upstreams, including
+  `input`, `instructions`, function `tools`, `tool_choice`,
+  `previous_response_id`, `output`, `output_text`, `usage`, and streaming SSE
+  events.
 - Public model aliases such as `llm-model` that map to real upstream model ids.
 - Per-client routing allowlists for restricting a client to specific upstream
   models.
@@ -90,6 +95,32 @@ print(response.choices[0].message.content)
 `max_model_len`; the router uses stored upstream-model metadata when available
 and falls back to the built-in default.
 
+## Responses API Compatibility
+
+`POST /v1/responses` is implemented as a compatibility layer for upstreams that
+support `/v1/chat/completions` but do not expose `/v1/responses` directly. The
+router:
+
+- resolves the requested public alias or real upstream model with the normal
+  client-aware routing rules;
+- converts Responses `input` and optional `instructions` into chat messages;
+- maps function `tools` and `tool_choice` into Chat Completions tool fields;
+- forwards the request to the selected upstream's `/chat/completions` endpoint;
+- converts JSON responses back into Responses objects with `output`,
+  `output_text`, and `usage`;
+- converts streaming chat deltas into Responses SSE events such as
+  `response.created`, `response.output_text.delta`,
+  `response.function_call_arguments.delta`, and `response.completed`.
+
+`previous_response_id` is supported by storing Responses conversation state in
+SQLite and replaying the prior chat message history for the same client. That
+state can include user inputs, assistant outputs, and function-call metadata, so
+the configured SQLite database must be treated as private runtime state.
+
+The compatibility layer is intentionally limited to text and function-tool
+workflows. It does not implement OpenAI-hosted built-in tools such as hosted web
+search or file search.
+
 ## Admin UI
 
 Set an admin password to enable `/admin`:
@@ -129,7 +160,7 @@ SQLite data in a Docker volume. Bootstrap the volume with commands such as:
 
 ```bash
 docker compose -f docker-compose.local.yml run --rm route-llm \
-  route-llm --database-url sqlite:///data/router.sqlite add-client \
+  api-router --database-url sqlite:///data/router.sqlite add-client \
   --name local --api-key "$ROUTE_LLM_CLIENT_TOKEN"
 ```
 
@@ -194,6 +225,11 @@ authorization headers, raw API keys, raw user agents, raw query strings, or
 upstream base URLs. They store ids, names, statuses, sizes, timings, date
 buckets, hashes/fingerprints, and numeric token counts.
 
+When `/v1/responses` uses `previous_response_id`, `response_states` stores the
+conversation state required to resume the response. Unlike audit rows, this
+state may include prompts, assistant output, and function-call arguments. Treat
+it with the same care as the SQLite key material.
+
 ## Project Structure
 
 ```text
@@ -201,6 +237,8 @@ src/main.rs          CLI entrypoint and command dispatch
 src/cli.rs           clap argument definitions
 src/server.rs        Axum app state, runtime config, and server startup
 src/http_proxy.rs    OpenAI-compatible proxy, retry, streaming, and audit glue
+src/responses_compat.rs
+                     Responses-to-chat compatibility adapter and SSE mapping
 src/db.rs            routing queries, admin summaries, audits, and DB mutations
 src/db/models.rs     shared data structs and constants
 src/db/schema.rs     SQLite connection setup, migrations, indexes, seed aliases
@@ -224,6 +262,7 @@ cargo fmt --check
 cargo test
 cargo clippy -- -D warnings
 cargo package --list --allow-dirty
+cargo build --release --bin api-router
 ```
 
 `cargo package --list --allow-dirty` should list source, docs, and assets only.

@@ -1,5 +1,6 @@
 use crate::{
     db::{self, Candidate},
+    responses_compat,
     server::AppState,
 };
 use axum::{
@@ -29,6 +30,16 @@ struct TokenUsage {
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     total_tokens: Option<i64>,
+}
+
+impl From<responses_compat::CompatUsage> for TokenUsage {
+    fn from(usage: responses_compat::CompatUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +120,22 @@ async fn proxy_inner(
         }
     };
     enrich_request_audit_from_body(&mut audit, &body);
+    let response_request = if is_responses_create_request(&parts, &state.config.public_prefix) {
+        match responses_compat::prepare_request(&state.pool, Some(client.id), &body).await {
+            Ok(request) => Some(request),
+            Err(error) => {
+                let status = StatusCode::BAD_REQUEST;
+                audit.status = Some(i64::from(status.as_u16()));
+                audit.outcome = "invalid_request".to_string();
+                audit.error_class = Some("invalid_responses_request".to_string());
+                audit.error_message = Some(sanitize_audit_text(&error.to_string(), 500));
+                save_audit_best_effort(&state, started_at, audit, &attempts).await;
+                return Ok(json_error(status, error.to_string()));
+            }
+        }
+    } else {
+        None
+    };
     let requested_model = request_model_from_body(&body);
     let candidates = db::candidates_for_client_request_model(
         &state.pool,
@@ -132,11 +159,12 @@ async fn proxy_inner(
 
     let mut last_failure: Option<UpstreamFailure> = None;
     for candidate in candidates {
-        let upstream_url = match build_upstream_url(
-            &candidate.base_url,
-            &state.config.public_prefix,
-            &parts.uri,
-        ) {
+        let upstream_url_result = if response_request.is_some() {
+            build_upstream_url_for_path(&candidate.base_url, &parts.uri, "/chat/completions")
+        } else {
+            build_upstream_url(&candidate.base_url, &state.config.public_prefix, &parts.uri)
+        };
+        let upstream_url = match upstream_url_result {
             Ok(url) => url,
             Err(error) => {
                 let status = StatusCode::INTERNAL_SERVER_ERROR;
@@ -165,14 +193,18 @@ async fn proxy_inner(
         let attempt_started_at = Instant::now();
         match send_once(
             &state,
-            &parts.method,
-            &parts.headers,
-            &body,
-            &candidate,
-            upstream_url,
-            UsageCapture {
-                enabled: should_capture_usage(&audit),
-                request_stream: audit.stream.unwrap_or(false),
+            SendOnceRequest {
+                method: &parts.method,
+                headers: &parts.headers,
+                body: &body,
+                candidate: &candidate,
+                upstream_url,
+                response_request: response_request.as_ref(),
+                client_id: Some(client.id),
+                usage_capture: UsageCapture {
+                    enabled: should_capture_usage(&audit),
+                    request_stream: audit.stream.unwrap_or(false),
+                },
             },
         )
         .await
@@ -311,27 +343,23 @@ async fn proxy_inner(
     }
 }
 
-async fn send_once(
-    state: &AppState,
-    method: &axum::http::Method,
-    headers: &HeaderMap,
-    body: &Bytes,
-    candidate: &Candidate,
-    upstream_url: String,
-    usage_capture: UsageCapture,
-) -> anyhow::Result<AttemptResult> {
-    let mut builder = state.client.request(method.clone(), upstream_url);
-    for (name, value) in headers {
+async fn send_once(state: &AppState, input: SendOnceRequest<'_>) -> anyhow::Result<AttemptResult> {
+    let mut builder = state
+        .client
+        .request(input.method.clone(), input.upstream_url);
+    for (name, value) in input.headers {
         if should_forward_header(name) {
             builder = builder.header(name, value);
         }
     }
+    let upstream_body = if let Some(response_request) = input.response_request {
+        response_request.body_for_candidate(input.candidate.resolved_model.as_deref())?
+    } else {
+        body_for_candidate(input.body, input.candidate.resolved_model.as_deref())?
+    };
     builder = builder
-        .bearer_auth(&candidate.api_key)
-        .body(body_for_candidate(
-            body,
-            candidate.resolved_model.as_deref(),
-        )?);
+        .bearer_auth(&input.candidate.api_key)
+        .body(upstream_body);
 
     let response = builder.send().await?;
     let status = response.status();
@@ -354,12 +382,39 @@ async fn send_once(
             response_builder = response_builder.header(name, value);
         }
     }
-    let (body, usage, stream_usage) = if usage_capture.enabled && is_json_response(&headers) {
+    let (body, usage, stream_usage) = if let Some(response_request) = input.response_request
+        && status.is_success()
+        && response_request.stream
+        && is_event_stream_response(&headers)
+    {
+        let stream_usage = StreamUsageAuditHandle::new();
+        let body = responses_compat::convert_streaming_response(
+            state.pool.clone(),
+            response.bytes_stream(),
+            response_request.clone(),
+            input.client_id,
+            stream_usage.clone(),
+        );
+        (body, None, Some(stream_usage))
+    } else if let Some(response_request) = input.response_request
+        && status.is_success()
+        && is_json_response(&headers)
+    {
+        let body = response.bytes().await.unwrap_or_default();
+        let (body, usage) = responses_compat::convert_json_response(
+            &state.pool,
+            input.client_id,
+            response_request,
+            &body,
+        )
+        .await?;
+        (Body::from(body), usage.map(TokenUsage::from), None)
+    } else if input.usage_capture.enabled && is_json_response(&headers) {
         let body = response.bytes().await.unwrap_or_default();
         let usage = extract_token_usage(&body);
         (Body::from(body), usage, None)
-    } else if usage_capture.enabled
-        && usage_capture.request_stream
+    } else if input.usage_capture.enabled
+        && input.usage_capture.request_stream
         && is_event_stream_response(&headers)
     {
         let stream_usage = StreamUsageAuditHandle::new();
@@ -423,6 +478,17 @@ struct UsageCapture {
     request_stream: bool,
 }
 
+struct SendOnceRequest<'a> {
+    method: &'a axum::http::Method,
+    headers: &'a HeaderMap,
+    body: &'a Bytes,
+    candidate: &'a Candidate,
+    upstream_url: String,
+    response_request: Option<&'a responses_compat::PreparedResponseRequest>,
+    client_id: Option<i64>,
+    usage_capture: UsageCapture,
+}
+
 enum AttemptResult {
     Success {
         response: Response<Body>,
@@ -440,24 +506,24 @@ enum AttemptResult {
 }
 
 #[derive(Clone)]
-struct StreamUsageAuditHandle {
+pub(crate) struct StreamUsageAuditHandle {
     audit_id: Arc<Mutex<Option<i64>>>,
 }
 
 impl StreamUsageAuditHandle {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             audit_id: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn set_audit_id(&self, audit_id: i64) {
+    pub(crate) fn set_audit_id(&self, audit_id: i64) {
         if let Ok(mut current) = self.audit_id.lock() {
             *current = Some(audit_id);
         }
     }
 
-    fn audit_id(&self) -> Option<i64> {
+    pub(crate) fn audit_id(&self) -> Option<i64> {
         self.audit_id.lock().ok().and_then(|current| *current)
     }
 }
@@ -935,6 +1001,14 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 fn build_upstream_url(base_url: &str, public_prefix: &str, uri: &Uri) -> anyhow::Result<String> {
     let upstream_path = path_after_public_prefix(public_prefix, uri.path());
+    build_upstream_url_for_path(base_url, uri, upstream_path)
+}
+
+fn build_upstream_url_for_path(
+    base_url: &str,
+    uri: &Uri,
+    upstream_path: &str,
+) -> anyhow::Result<String> {
     let mut url = format!(
         "{}/{}",
         base_url.trim_end_matches('/'),
@@ -945,6 +1019,11 @@ fn build_upstream_url(base_url: &str, public_prefix: &str, uri: &Uri) -> anyhow:
         url.push_str(query);
     }
     Ok(url)
+}
+
+fn is_responses_create_request(parts: &Parts, public_prefix: &str) -> bool {
+    parts.method == Method::POST
+        && path_after_public_prefix(public_prefix, parts.uri.path()) == "/responses"
 }
 
 fn is_models_list_request(parts: &Parts, public_prefix: &str) -> bool {
@@ -1036,6 +1115,14 @@ mod tests {
     }
 
     #[test]
+    fn responses_compat_uses_chat_completions_upstream_path() {
+        let uri: Uri = "/v1/responses?timeout=30".parse().unwrap();
+        let url = build_upstream_url_for_path("https://example.com/v1", &uri, "/chat/completions")
+            .expect("url should build");
+        assert_eq!(url, "https://example.com/v1/chat/completions?timeout=30");
+    }
+
+    #[test]
     fn preserves_path_without_public_prefix() {
         let uri: Uri = "/health".parse().unwrap();
         let url = build_upstream_url("https://example.com/v1", "/v1", &uri).unwrap();
@@ -1070,6 +1157,27 @@ mod tests {
             .into_parts()
             .0;
         assert!(is_models_list_request(&parts, "/v1"));
+    }
+
+    #[test]
+    fn detects_responses_create_endpoint() {
+        let parts = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .body(Body::empty())
+            .unwrap()
+            .into_parts()
+            .0;
+        let get_parts = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/responses")
+            .body(Body::empty())
+            .unwrap()
+            .into_parts()
+            .0;
+
+        assert!(is_responses_create_request(&parts, "/v1"));
+        assert!(!is_responses_create_request(&get_parts, "/v1"));
     }
 
     #[tokio::test]

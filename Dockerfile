@@ -13,7 +13,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /app/target/release/route-llm /usr/local/bin/route-llm
+COPY --from=builder /app/target/release/api-router /usr/local/bin/api-router
 
 ENV ROUTE_LLM_BIND=0.0.0.0:8080
 ENV ROUTE_LLM_DATABASE_URL=sqlite:///data/router.sqlite
@@ -21,4 +21,4 @@ ENV ROUTE_LLM_DATABASE_URL=sqlite:///data/router.sqlite
 VOLUME ["/data"]
 EXPOSE 8080
 
-CMD ["route-llm", "serve"]
+CMD ["api-router", "serve"]

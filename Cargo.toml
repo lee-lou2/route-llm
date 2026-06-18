@@ -21,6 +21,10 @@ include = [
   "assets/**",
 ]
 
+[[bin]]
+name = "api-router"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
 async-stream = "0.3"
