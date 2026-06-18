@@ -1258,9 +1258,13 @@ pub async fn insert_request_audit(
                 retry_after_secs,
                 disabled_until,
                 error_class,
-                error_message
+                error_message,
+                upstream_content_type,
+                upstream_body_bytes,
+                upstream_body_hash,
+                upstream_body_kind
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             "#,
         )
         .bind(request_audit_id)
@@ -1277,6 +1281,10 @@ pub async fn insert_request_audit(
         .bind(attempt.disabled_until)
         .bind(attempt.error_class.as_deref())
         .bind(attempt.error_message.as_deref().map(truncate_error))
+        .bind(attempt.upstream_content_type.as_deref())
+        .bind(attempt.upstream_body_bytes)
+        .bind(attempt.upstream_body_hash.as_deref())
+        .bind(attempt.upstream_body_kind.as_deref())
         .execute(pool)
         .await?;
     }
@@ -3368,6 +3376,10 @@ mod tests {
             disabled_until: None,
             error_class: None,
             error_message: None,
+            upstream_content_type: Some("application/json".to_string()),
+            upstream_body_bytes: Some(128),
+            upstream_body_hash: Some("sha256:test".to_string()),
+            upstream_body_kind: Some("json_like".to_string()),
         };
 
         let id = insert_request_audit(&pool, &request_audit, &[attempt])
@@ -3377,10 +3389,18 @@ mod tests {
             r#"
             SELECT completed_date, attempts,
                 (SELECT count(*) FROM upstream_attempt_audits WHERE request_audit_id = ?) AS attempt_rows
+                ,(SELECT upstream_content_type FROM upstream_attempt_audits WHERE request_audit_id = ?) AS attempt_content_type
+                ,(SELECT upstream_body_bytes FROM upstream_attempt_audits WHERE request_audit_id = ?) AS attempt_body_bytes
+                ,(SELECT upstream_body_hash FROM upstream_attempt_audits WHERE request_audit_id = ?) AS attempt_body_hash
+                ,(SELECT upstream_body_kind FROM upstream_attempt_audits WHERE request_audit_id = ?) AS attempt_body_kind
             FROM request_audits
             WHERE id = ?;
             "#,
         )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .bind(id)
         .bind(id)
         .bind(id)
         .fetch_one(&pool)
@@ -3390,6 +3410,13 @@ mod tests {
         assert_eq!(row.get::<String, _>("completed_date").len(), 10);
         assert_eq!(row.get::<i64, _>("attempts"), 1);
         assert_eq!(row.get::<i64, _>("attempt_rows"), 1);
+        assert_eq!(
+            row.get::<String, _>("attempt_content_type"),
+            "application/json"
+        );
+        assert_eq!(row.get::<i64, _>("attempt_body_bytes"), 128);
+        assert_eq!(row.get::<String, _>("attempt_body_hash"), "sha256:test");
+        assert_eq!(row.get::<String, _>("attempt_body_kind"), "json_like");
         close_and_remove(pool, path).await;
     }
 

@@ -331,11 +331,43 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
             retry_after_secs INTEGER,
             disabled_until INTEGER,
             error_class TEXT,
-            error_message TEXT
+            error_message TEXT,
+            upstream_content_type TEXT,
+            upstream_body_bytes INTEGER,
+            upstream_body_hash TEXT,
+            upstream_body_kind TEXT
         );
         "#,
     )
     .execute(pool)
+    .await?;
+    ensure_column(
+        pool,
+        "upstream_attempt_audits",
+        "upstream_content_type",
+        "upstream_content_type TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "upstream_attempt_audits",
+        "upstream_body_bytes",
+        "upstream_body_bytes INTEGER",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "upstream_attempt_audits",
+        "upstream_body_hash",
+        "upstream_body_hash TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "upstream_attempt_audits",
+        "upstream_body_kind",
+        "upstream_body_kind TEXT",
+    )
     .await?;
 
     sqlx::query(

@@ -9,7 +9,7 @@ use axum::{
     extract::State,
     http::{
         HeaderMap, HeaderName, Method, Request, Response, StatusCode, Uri,
-        header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST},
+        header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST},
         request::Parts,
     },
     response::IntoResponse,
@@ -17,6 +17,7 @@ use axum::{
 use futures_util::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::{
     sync::{Arc, Mutex},
@@ -214,6 +215,7 @@ async fn proxy_inner(
                 status,
                 usage,
                 stream_usage,
+                upstream_response,
             }) => {
                 db::mark_key_success(&state.pool, candidate.key_id).await?;
                 audit.upstream_id = Some(candidate.upstream_id);
@@ -235,6 +237,7 @@ async fn proxy_inner(
                         disabled_until: None,
                         error_class: None,
                         error_message: None,
+                        upstream_response: upstream_response.as_ref(),
                     },
                 ));
                 let audit_id = save_audit_best_effort(&state, started_at, audit, &attempts).await;
@@ -248,6 +251,7 @@ async fn proxy_inner(
                 status,
                 usage,
                 stream_usage,
+                upstream_response,
             }) => {
                 audit.upstream_id = Some(candidate.upstream_id);
                 audit.upstream_name = Some(candidate.upstream_name.clone());
@@ -268,6 +272,7 @@ async fn proxy_inner(
                         disabled_until: None,
                         error_class: None,
                         error_message: None,
+                        upstream_response: upstream_response.as_ref(),
                     },
                 ));
                 let audit_id = save_audit_best_effort(&state, started_at, audit, &attempts).await;
@@ -290,9 +295,43 @@ async fn proxy_inner(
                         disabled_until: Some(disabled_until),
                         error_class: Some("retriable_upstream_status"),
                         error_message: Some(failure.message.as_str()),
+                        upstream_response: failure.upstream_response.as_ref(),
                     },
                 ));
                 last_failure = Some(failure);
+            }
+            Ok(AttemptResult::ResponseConversionError {
+                response,
+                upstream_status,
+                upstream_response,
+                message,
+            }) => {
+                let status = StatusCode::BAD_GATEWAY;
+                audit.upstream_id = Some(candidate.upstream_id);
+                audit.upstream_name = Some(candidate.upstream_name.clone());
+                audit.upstream_key_id = Some(candidate.key_id);
+                audit.upstream_key_name = Some(candidate.key_name.clone());
+                audit.status = Some(i64::from(status.as_u16()));
+                audit.outcome = "response_conversion_error".to_string();
+                audit.error_class = Some("response_conversion_error".to_string());
+                audit.error_message = Some(sanitize_audit_text(&message, 500));
+                attempts.push(new_attempt_audit(
+                    &candidate,
+                    AttemptAuditInput {
+                        attempt_index,
+                        status: Some(upstream_status.as_u16()),
+                        outcome: "response_conversion_error",
+                        retriable: false,
+                        duration_ms: elapsed_ms(attempt_started_at),
+                        retry_after_secs: None,
+                        disabled_until: None,
+                        error_class: Some("response_conversion_error"),
+                        error_message: Some(message.as_str()),
+                        upstream_response: Some(&upstream_response),
+                    },
+                ));
+                save_audit_best_effort(&state, started_at, audit, &attempts).await;
+                return Ok(response);
             }
             Err(error) => {
                 let failure = UpstreamFailure {
@@ -300,6 +339,7 @@ async fn proxy_inner(
                     retry_after_secs: None,
                     message: error.to_string(),
                     body: Bytes::new(),
+                    upstream_response: None,
                 };
                 let disabled_until = mark_failure(&state, candidate.key_id, &failure).await?;
                 attempts.push(new_attempt_audit(
@@ -314,6 +354,7 @@ async fn proxy_inner(
                         disabled_until: Some(disabled_until),
                         error_class: Some("upstream_transport_error"),
                         error_message: Some(failure.message.as_str()),
+                        upstream_response: failure.upstream_response.as_ref(),
                     },
                 ));
                 last_failure = Some(failure);
@@ -367,12 +408,14 @@ async fn send_once(state: &AppState, input: SendOnceRequest<'_>) -> anyhow::Resu
 
     if is_retriable_status(status) {
         let body = response.bytes().await.unwrap_or_default();
+        let upstream_response = upstream_response_audit_from_body(&headers, &body);
         let retry_after_secs = parse_retry_after(&headers);
         return Ok(AttemptResult::Retry(UpstreamFailure {
             status: Some(status.as_u16()),
             retry_after_secs,
             message: format!("upstream returned retriable status {}", status.as_u16()),
             body,
+            upstream_response: Some(upstream_response),
         }));
     }
 
@@ -382,37 +425,95 @@ async fn send_once(state: &AppState, input: SendOnceRequest<'_>) -> anyhow::Resu
             response_builder = response_builder.header(name, value);
         }
     }
-    let (body, usage, stream_usage) = if let Some(response_request) = input.response_request
+    let (body, usage, stream_usage, upstream_response) = if let Some(response_request) =
+        input.response_request
         && status.is_success()
-        && response_request.stream
-        && is_event_stream_response(&headers)
     {
-        let stream_usage = StreamUsageAuditHandle::new();
-        let body = responses_compat::convert_streaming_response(
-            state.pool.clone(),
-            response.bytes_stream(),
-            response_request.clone(),
-            input.client_id,
-            stream_usage.clone(),
-        );
-        (body, None, Some(stream_usage))
-    } else if let Some(response_request) = input.response_request
-        && status.is_success()
-        && is_json_response(&headers)
-    {
-        let body = response.bytes().await.unwrap_or_default();
-        let (body, usage) = responses_compat::convert_json_response(
-            &state.pool,
-            input.client_id,
-            response_request,
-            &body,
-        )
-        .await?;
-        (Body::from(body), usage.map(TokenUsage::from), None)
+        if response_request.stream {
+            if is_event_stream_response(&headers) {
+                let stream_usage = StreamUsageAuditHandle::new();
+                let body = responses_compat::convert_streaming_response(
+                    state.pool.clone(),
+                    response.bytes_stream(),
+                    response_request.clone(),
+                    input.client_id,
+                    stream_usage.clone(),
+                );
+                (
+                    body,
+                    None,
+                    Some(stream_usage),
+                    Some(upstream_response_audit_from_headers(&headers)),
+                )
+            } else {
+                return Ok(response_conversion_error_from_response(
+                    response,
+                    &headers,
+                    status,
+                    "upstream Responses stream adapter expected text/event-stream response",
+                )
+                .await);
+            }
+        } else if is_json_response(&headers) {
+            let body = match response.bytes().await {
+                Ok(body) => body,
+                Err(error) => {
+                    return Ok(AttemptResult::ResponseConversionError {
+                        response: json_error(
+                            StatusCode::BAD_GATEWAY,
+                            "failed to read upstream response body for Responses conversion"
+                                .to_string(),
+                        ),
+                        upstream_status: status,
+                        upstream_response: upstream_response_audit_from_headers(&headers),
+                        message: format!(
+                            "failed to read upstream response body for Responses conversion: {error}"
+                        ),
+                    });
+                }
+            };
+            let upstream_response = upstream_response_audit_from_body(&headers, &body);
+            let (body, usage) = match responses_compat::convert_json_response(
+                &state.pool,
+                input.client_id,
+                response_request,
+                &body,
+            )
+            .await
+            {
+                Ok(converted) => converted,
+                Err(error) => {
+                    let message = format!(
+                        "failed to convert upstream chat completion response to Responses format: {error}"
+                    );
+                    return Ok(AttemptResult::ResponseConversionError {
+                        response: json_error(StatusCode::BAD_GATEWAY, message.clone()),
+                        upstream_status: status,
+                        upstream_response,
+                        message,
+                    });
+                }
+            };
+            (
+                Body::from(body),
+                usage.map(TokenUsage::from),
+                None,
+                Some(upstream_response),
+            )
+        } else {
+            return Ok(response_conversion_error_from_response(
+                response,
+                &headers,
+                status,
+                "upstream Responses adapter expected JSON response",
+            )
+            .await);
+        }
     } else if input.usage_capture.enabled && is_json_response(&headers) {
         let body = response.bytes().await.unwrap_or_default();
         let usage = extract_token_usage(&body);
-        (Body::from(body), usage, None)
+        let upstream_response = upstream_response_audit_from_body(&headers, &body);
+        (Body::from(body), usage, None, Some(upstream_response))
     } else if input.usage_capture.enabled
         && input.usage_capture.request_stream
         && is_event_stream_response(&headers)
@@ -423,12 +524,22 @@ async fn send_once(state: &AppState, input: SendOnceRequest<'_>) -> anyhow::Resu
             response.bytes_stream(),
             stream_usage.clone(),
         );
-        (body, None, Some(stream_usage))
+        (
+            body,
+            None,
+            Some(stream_usage),
+            Some(upstream_response_audit_from_headers(&headers)),
+        )
     } else {
         let stream = response
             .bytes_stream()
             .map_err(|error| std::io::Error::other(error.to_string()));
-        (Body::from_stream(stream), None, None)
+        (
+            Body::from_stream(stream),
+            None,
+            None,
+            Some(upstream_response_audit_from_headers(&headers)),
+        )
     };
     let proxied = response_builder.body(body)?;
 
@@ -438,6 +549,7 @@ async fn send_once(state: &AppState, input: SendOnceRequest<'_>) -> anyhow::Resu
             status,
             usage,
             stream_usage,
+            upstream_response,
         })
     } else {
         Ok(AttemptResult::NonRetriable {
@@ -445,6 +557,7 @@ async fn send_once(state: &AppState, input: SendOnceRequest<'_>) -> anyhow::Resu
             status,
             usage,
             stream_usage,
+            upstream_response,
         })
     }
 }
@@ -495,14 +608,22 @@ enum AttemptResult {
         status: StatusCode,
         usage: Option<TokenUsage>,
         stream_usage: Option<StreamUsageAuditHandle>,
+        upstream_response: Option<UpstreamResponseAudit>,
     },
     NonRetriable {
         response: Response<Body>,
         status: StatusCode,
         usage: Option<TokenUsage>,
         stream_usage: Option<StreamUsageAuditHandle>,
+        upstream_response: Option<UpstreamResponseAudit>,
     },
     Retry(UpstreamFailure),
+    ResponseConversionError {
+        response: Response<Body>,
+        upstream_status: StatusCode,
+        upstream_response: UpstreamResponseAudit,
+        message: String,
+    },
 }
 
 #[derive(Clone)]
@@ -615,6 +736,15 @@ struct UpstreamFailure {
     retry_after_secs: Option<i64>,
     message: String,
     body: Bytes,
+    upstream_response: Option<UpstreamResponseAudit>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UpstreamResponseAudit {
+    content_type: Option<String>,
+    body_bytes: Option<i64>,
+    body_hash: Option<String>,
+    body_kind: Option<String>,
 }
 
 fn response_from_failure(failure: UpstreamFailure) -> Response<Body> {
@@ -646,6 +776,84 @@ fn json_error(status: StatusCode, message: String) -> Response<Body> {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("response builder is valid")
+}
+
+async fn response_conversion_error_from_response(
+    response: reqwest::Response,
+    headers: &HeaderMap,
+    status: StatusCode,
+    reason: &str,
+) -> AttemptResult {
+    match response.bytes().await {
+        Ok(body) => {
+            let upstream_response = upstream_response_audit_from_body(headers, &body);
+            let message = format!(
+                "{reason}; upstream_content_type={}; upstream_body_bytes={}; upstream_body_kind={}",
+                upstream_response
+                    .content_type
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                upstream_response.body_bytes.unwrap_or(0),
+                upstream_response.body_kind.as_deref().unwrap_or("unknown")
+            );
+            AttemptResult::ResponseConversionError {
+                response: json_error(StatusCode::BAD_GATEWAY, message.clone()),
+                upstream_status: status,
+                upstream_response,
+                message,
+            }
+        }
+        Err(error) => {
+            let message =
+                format!("{reason}; failed to read upstream response body for diagnostics: {error}");
+            AttemptResult::ResponseConversionError {
+                response: json_error(StatusCode::BAD_GATEWAY, message.clone()),
+                upstream_status: status,
+                upstream_response: upstream_response_audit_from_headers(headers),
+                message,
+            }
+        }
+    }
+}
+
+fn upstream_response_audit_from_headers(headers: &HeaderMap) -> UpstreamResponseAudit {
+    UpstreamResponseAudit {
+        content_type: header_string(headers, "content-type", 200),
+        ..UpstreamResponseAudit::default()
+    }
+}
+
+fn upstream_response_audit_from_body(headers: &HeaderMap, body: &Bytes) -> UpstreamResponseAudit {
+    UpstreamResponseAudit {
+        content_type: header_string(headers, "content-type", 200),
+        body_bytes: Some(body.len().min(i64::MAX as usize) as i64),
+        body_hash: Some(sha256_hash_bytes(body)),
+        body_kind: Some(response_body_kind(body).to_string()),
+    }
+}
+
+fn sha256_hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn response_body_kind(body: &[u8]) -> &'static str {
+    let Some(first_index) = body.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+        return "empty";
+    };
+    let trimmed = &body[first_index..];
+    if trimmed.starts_with(b"{") || trimmed.starts_with(b"[") {
+        "json_like"
+    } else if trimmed.starts_with(b"data:") {
+        "sse_like"
+    } else if trimmed.starts_with(b"<") {
+        "html_like"
+    } else if std::str::from_utf8(trimmed).is_ok() {
+        "text_like"
+    } else {
+        "binary_like"
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -889,6 +1097,7 @@ struct AttemptAuditInput<'a> {
     disabled_until: Option<i64>,
     error_class: Option<&'a str>,
     error_message: Option<&'a str>,
+    upstream_response: Option<&'a UpstreamResponseAudit>,
 }
 
 fn new_attempt_audit(candidate: &Candidate, input: AttemptAuditInput<'_>) -> db::AttemptAudit {
@@ -908,6 +1117,18 @@ fn new_attempt_audit(candidate: &Candidate, input: AttemptAuditInput<'_>) -> db:
         error_message: input
             .error_message
             .map(|value| sanitize_audit_text(value, 500)),
+        upstream_content_type: input
+            .upstream_response
+            .and_then(|response| response.content_type.clone()),
+        upstream_body_bytes: input
+            .upstream_response
+            .and_then(|response| response.body_bytes),
+        upstream_body_hash: input
+            .upstream_response
+            .and_then(|response| response.body_hash.clone()),
+        upstream_body_kind: input
+            .upstream_response
+            .and_then(|response| response.body_kind.clone()),
     }
 }
 
@@ -1073,7 +1294,11 @@ fn is_retriable_status(status: StatusCode) -> bool {
 }
 
 fn should_forward_header(name: &HeaderName) -> bool {
-    name != AUTHORIZATION && name != HOST && name != CONTENT_LENGTH && !is_hop_by_hop_header(name)
+    name != AUTHORIZATION
+        && name != HOST
+        && name != CONTENT_LENGTH
+        && name != ACCEPT_ENCODING
+        && !is_hop_by_hop_header(name)
 }
 
 fn should_return_header(name: &HeaderName) -> bool {
@@ -1105,6 +1330,9 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, routing::post};
+    use sqlx::Row;
+    use std::path::PathBuf;
 
     #[test]
     fn strips_public_prefix_when_building_upstream_url() {
@@ -1245,6 +1473,157 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[tokio::test]
+    async fn responses_conversion_error_does_not_disable_upstream_key() {
+        let (upstream_base_url, upstream_task) = start_invalid_json_upstream().await;
+        let (pool, path) = proxy_test_pool("responses-conversion-error").await;
+        let client_key = "client-secret";
+        db::upsert_client(&pool, "client", client_key, true)
+            .await
+            .unwrap();
+        let upstream_id = db::upsert_upstream(&pool, "provider", &upstream_base_url, 10, true)
+            .await
+            .unwrap();
+        let upstream_key_id =
+            db::upsert_upstream_key_by_id(&pool, upstream_id, "key", "upstream-secret", 10, true)
+                .await
+                .unwrap();
+        let upstream_model_id = db::upsert_upstream_model_by_id_with_max_model_len(
+            &pool,
+            upstream_id,
+            "provider-llm",
+            10,
+            true,
+            &["llm"],
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO model_alias_routes(public_model, upstream_model_id, priority, enabled)
+            VALUES ('llm-model', ?, 10, 1);
+            "#,
+        )
+        .bind(upstream_model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            client: reqwest::Client::new(),
+            config: crate::server::ProxyConfig {
+                public_prefix: "/v1".to_string(),
+                transient_failure_ttl_secs: 300,
+                auth_failure_ttl_secs: 3600,
+                max_body_bytes: 1024 * 1024,
+                admin: crate::server::AdminConfig {
+                    password_hash: None,
+                    session_token: None,
+                    site_name: "Route LLM".to_string(),
+                    site_description: "Local OpenAI-compatible routing proxy".to_string(),
+                    public_base_url: None,
+                },
+            },
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(AUTHORIZATION, format!("Bearer {client_key}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"llm-model","input":"hello from responses"}"#,
+            ))
+            .unwrap();
+
+        let response = proxy_inner(state, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("failed to convert upstream chat completion response")
+        );
+
+        let key = sqlx::query(
+            "SELECT disabled_until, consecutive_failures FROM upstream_keys WHERE id = ?;",
+        )
+        .bind(upstream_key_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(key.get::<Option<i64>, _>("disabled_until").is_none());
+        assert_eq!(key.get::<i64, _>("consecutive_failures"), 0);
+
+        let audit = sqlx::query(
+            r#"
+            SELECT id, status, outcome, error_class, error_message, attempts
+            FROM request_audits
+            ORDER BY id DESC
+            LIMIT 1;
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.get::<i64, _>("status"), 502);
+        assert_eq!(
+            audit.get::<String, _>("outcome"),
+            "response_conversion_error"
+        );
+        assert_eq!(
+            audit.get::<String, _>("error_class"),
+            "response_conversion_error"
+        );
+        assert_eq!(audit.get::<i64, _>("attempts"), 1);
+        assert!(
+            audit
+                .get::<String, _>("error_message")
+                .contains("expected value at line 1 column 1")
+        );
+
+        let attempt = sqlx::query(
+            r#"
+            SELECT status, outcome, retriable, disabled_until, error_class,
+                upstream_content_type, upstream_body_bytes, upstream_body_hash, upstream_body_kind
+            FROM upstream_attempt_audits
+            WHERE request_audit_id = ?;
+            "#,
+        )
+        .bind(audit.get::<i64, _>("id"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempt.get::<i64, _>("status"), 200);
+        assert_eq!(
+            attempt.get::<String, _>("outcome"),
+            "response_conversion_error"
+        );
+        assert_eq!(attempt.get::<i64, _>("retriable"), 0);
+        assert!(attempt.get::<Option<i64>, _>("disabled_until").is_none());
+        assert_eq!(
+            attempt.get::<String, _>("error_class"),
+            "response_conversion_error"
+        );
+        assert_eq!(
+            attempt.get::<String, _>("upstream_content_type"),
+            "application/json"
+        );
+        assert!(attempt.get::<i64, _>("upstream_body_bytes") > 0);
+        assert!(
+            attempt
+                .get::<String, _>("upstream_body_hash")
+                .starts_with("sha256:")
+        );
+        assert_eq!(attempt.get::<String, _>("upstream_body_kind"), "html_like");
+
+        upstream_task.abort();
+        close_proxy_test_pool(pool, path).await;
     }
 
     #[test]
@@ -1409,6 +1788,16 @@ data: [DONE]
     }
 
     #[test]
+    fn response_body_kind_classifies_without_storing_body_prefix() {
+        assert_eq!(response_body_kind(b""), "empty");
+        assert_eq!(response_body_kind(br#" {"ok":true}"#), "json_like");
+        assert_eq!(response_body_kind(b"data: {}\n\n"), "sse_like");
+        assert_eq!(response_body_kind(b"<html></html>"), "html_like");
+        assert_eq!(response_body_kind(b"plain text"), "text_like");
+        assert_eq!(response_body_kind(&[0xff, 0x00]), "binary_like");
+    }
+
+    #[test]
     fn bearer_token_requires_standard_bearer_prefix() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer token".parse().unwrap());
@@ -1423,6 +1812,7 @@ data: [DONE]
         assert!(!should_forward_header(&AUTHORIZATION));
         assert!(!should_forward_header(&HOST));
         assert!(!should_forward_header(&CONTENT_LENGTH));
+        assert!(!should_forward_header(&ACCEPT_ENCODING));
         assert!(!should_forward_header(&HeaderName::from_static(
             "connection"
         )));
@@ -1472,5 +1862,45 @@ data: [DONE]
         assert_eq!(route_kind("/v1/images/generations"), "images");
         assert_eq!(route_kind("/v1/audio/speech"), "audio");
         assert_eq!(route_kind("/v1/unknown"), "other");
+    }
+
+    async fn start_invalid_json_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("<html>not json</html>"))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    async fn proxy_test_pool(name: &str) -> (SqlitePool, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "route-llm-http-proxy-{name}-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let url = format!("sqlite://{}", path.display());
+        let pool = db::connect(&url).await.unwrap();
+        (pool, path)
+    }
+
+    async fn close_proxy_test_pool(pool: SqlitePool, path: PathBuf) {
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     }
 }

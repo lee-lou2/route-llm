@@ -90,6 +90,10 @@ pub struct AttemptAudit {
     pub disabled_until: Option<i64>,
     pub error_class: Option<String>,
     pub error_message: Option<String>,
+    pub upstream_content_type: Option<String>,
+    pub upstream_body_bytes: Option<i64>,
+    pub upstream_body_hash: Option<String>,
+    pub upstream_body_kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

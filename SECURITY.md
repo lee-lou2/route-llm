@@ -28,7 +28,9 @@ state. They must not be committed or attached to public issues.
 
 Request audit rows are sanitized and must not contain prompts, responses, raw
 authorization headers, raw API keys, raw user agents, raw query strings, or
-upstream base URLs.
+upstream base URLs. Attempt audits may store upstream status, content type,
+response byte count, response hash, and response kind, but not raw response
+bodies or body prefixes.
 
 Responses compatibility state is different from audit data. When
 `/v1/responses` uses `previous_response_id`, the `response_states` table stores

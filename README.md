@@ -112,6 +112,14 @@ router:
   `response.created`, `response.output_text.delta`,
   `response.function_call_arguments.delta`, and `response.completed`.
 
+If a successful upstream chat response cannot be converted back into Responses
+JSON, the request fails as `response_conversion_error` without disabling the
+upstream key. Attempt audits keep safe response diagnostics such as upstream
+status, content type, body byte count, body hash, and body kind, but not the raw
+response body or body prefix. The proxy also strips `Accept-Encoding` before
+forwarding so upstream JSON needed for conversion is not returned as compressed
+binary data.
+
 `previous_response_id` is supported by storing Responses conversation state in
 SQLite and replaying the prior chat message history for the same client. That
 state can include user inputs, assistant outputs, and function-call metadata, so
@@ -223,7 +231,8 @@ public issues.
 Audit rows intentionally do not store request bodies, response bodies, raw
 authorization headers, raw API keys, raw user agents, raw query strings, or
 upstream base URLs. They store ids, names, statuses, sizes, timings, date
-buckets, hashes/fingerprints, and numeric token counts.
+buckets, hashes/fingerprints, numeric token counts, and safe upstream response
+diagnostics for attempts.
 
 When `/v1/responses` uses `previous_response_id`, `response_states` stores the
 conversation state required to resume the response. Unlike audit rows, this

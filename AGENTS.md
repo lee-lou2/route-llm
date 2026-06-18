@@ -57,7 +57,9 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
 - Audit rows must not store request bodies, response bodies, raw Authorization
   headers, raw API keys, raw user agents, raw query strings, or upstream base
   URLs. Store ids, names, statuses, sizes, timings, date buckets, hashes,
-  fingerprints, and numeric token counts instead.
+  fingerprints, numeric token counts, and safe attempt diagnostics such as
+  upstream content type, response byte count, response hash, and response kind
+  instead.
 - Responses compatibility state is not audit data. `response_states` may store
   conversation history, assistant outputs, and function-call arguments so
   `previous_response_id` can be replayed for the same client. Treat it as
@@ -80,6 +82,9 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
   adding `stream_options.include_usage = true` to JSON request bodies so
   compatible upstreams can emit final usage. Parse only SSE `usage` metadata and
   update the audit row after the stream completes.
+- Do not forward client or proxy `Accept-Encoding` to upstreams. The router must
+  inspect JSON bodies for usage capture and Responses conversion, and compressed
+  upstream bodies can otherwise look like invalid binary JSON.
 - Keep public model aliases stable. Clients use aliases like `llm-model` as the
   actual SDK model name. The router resolves that alias to an ordered list of
   concrete upstream models and rewrites request bodies to the chosen upstream
@@ -94,6 +99,10 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
 - Retriable upstream failures are `401`, `403`, `429`, and `5xx`.
 - Failed upstream keys should be skipped via `disabled_until` rather than
   rechecked on every request.
+- Responses adapter conversion failures are not upstream key failures. Classify
+  them as `response_conversion_error`, do not set `disabled_until`, and do not
+  retry every key for the same conversion failure. Record safe response metadata
+  only; never store raw upstream response bodies or body prefixes in audits.
 - Keep audit writes best-effort; audit persistence problems should be logged but
   should not fail an otherwise valid proxy response.
 - Admin writes must go through SQLite and take effect on the next request
@@ -133,6 +142,8 @@ Data flow:
    `output_text`, `usage`, and streaming events.
 7. Store `response_states` only after a successful converted response so
    `previous_response_id` can replay the same client's prior chat history.
+8. If conversion fails after a successful upstream response, return
+   `response_conversion_error` without disabling the upstream key.
 
 Do not store Responses request or response bodies in `request_audits`.
 `response_states` is allowed to store conversation state for
