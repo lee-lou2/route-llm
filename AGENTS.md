@@ -101,6 +101,64 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
 - Keep direct dependencies minimal. Remove unused crate dependencies after
   confirming `cargo test` and `cargo clippy -- -D warnings` still pass.
 
+## Responses Compatibility Guide
+
+Use this section whenever the task touches `POST /v1/responses`, Codex custom
+model-provider support, streaming event shape, tools, or `previous_response_id`.
+
+Primary files:
+
+- `src/http_proxy.rs`: request authentication, routing candidate selection,
+  upstream retry behavior, audit writes, and the decision to route
+  `POST /v1/responses` to the selected upstream `/chat/completions` path.
+- `src/responses_compat.rs`: Responses request normalization, Chat
+  Completions request construction, JSON response conversion, SSE event
+  conversion, function tool-call mapping, and `previous_response_id` replay
+  preparation.
+- `src/db/schema.rs`, `src/db.rs`, and `src/db/models.rs`: `response_states`
+  migration and state read/write helpers.
+
+Data flow:
+
+1. Authenticate the client token exactly as normal proxy requests do.
+2. Parse the Responses body and extract the public `model` before routing.
+3. Resolve candidates with the existing model routing rules. Do not create a
+   separate routing path for Responses requests.
+4. Build a Chat Completions payload from Responses `input`, optional
+   `instructions`, function `tools`, `tool_choice`, and stream settings.
+5. Send the converted request to the selected upstream `/chat/completions`
+   endpoint, while preserving retry and disabled-key behavior.
+6. Convert upstream JSON or SSE back into Responses-compatible `output`,
+   `output_text`, `usage`, and streaming events.
+7. Store `response_states` only after a successful converted response so
+   `previous_response_id` can replay the same client's prior chat history.
+
+Do not store Responses request or response bodies in `request_audits`.
+`response_states` is allowed to store conversation state for
+`previous_response_id`, but it is sensitive runtime state and must stay in the
+SQLite database only.
+
+Supported Responses compatibility surface:
+
+- Text input and message-array input.
+- Optional `instructions` as a system message.
+- Function tools and function `tool_choice`.
+- Function-call outputs through `input` items of type
+  `function_call_output`.
+- `stream: true` SSE conversion for text deltas and function-call argument
+  deltas.
+- `previous_response_id` scoped to the authenticated client.
+- `output`, `output_text`, and token `usage`.
+
+Do not imply full native OpenAI Responses parity. The adapter does not implement
+OpenAI-hosted built-in tools such as hosted web search or file search unless
+explicit code and tests are added for them.
+
+When validating against a real configured endpoint, do not print raw client
+tokens or upstream API keys. Read tokens into shell variables and report only
+HTTP status, response ids, event names, output snippets, usage fields, and audit
+row summaries.
+
 ## Model Routing Model
 
 The routing model has separate concepts. Keep them separate when making changes:
