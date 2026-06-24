@@ -102,7 +102,7 @@ async fn proxy_inner(
         audit.status = Some(i64::from(StatusCode::OK.as_u16()));
         audit.outcome = "success".to_string();
         save_audit_best_effort(&state, started_at, audit, &attempts).await;
-        return models_list_response(&state).await;
+        return models_list_response(&state, wants_codex_models_catalog(parts.uri.query())).await;
     }
 
     let body = match to_bytes(body, state.config.max_body_bytes).await {
@@ -138,6 +138,19 @@ async fn proxy_inner(
         None
     };
     let requested_model = request_model_from_body(&body);
+    if let Some(model) = requested_model.as_deref()
+        && !db::is_registered_request_model(&state.pool, model).await?
+    {
+        let status = StatusCode::NOT_FOUND;
+        let safe_model = sanitize_audit_text(model, 200);
+        let message = format!("model `{safe_model}` was not found in the route-llm model registry");
+        audit.status = Some(i64::from(status.as_u16()));
+        audit.outcome = "model_not_found".to_string();
+        audit.error_class = Some("model_not_found".to_string());
+        audit.error_message = Some(message.clone());
+        save_audit_best_effort(&state, started_at, audit, &attempts).await;
+        return Ok(json_error_with_type(status, message, "model_not_found"));
+    }
     let candidates = db::candidates_for_client_request_model(
         &state.pool,
         Some(client.id),
@@ -765,10 +778,19 @@ fn response_from_failure(failure: UpstreamFailure) -> Response<Body> {
 }
 
 fn json_error(status: StatusCode, message: String) -> Response<Body> {
+    json_error_with_type(status, message, "route_llm_error")
+}
+
+fn json_error_with_type(
+    status: StatusCode,
+    message: String,
+    error_type: &'static str,
+) -> Response<Body> {
     let body = serde_json::json!({
         "error": {
             "message": message,
-            "type": "route_llm_error"
+            "type": error_type,
+            "code": error_type
         }
     });
     Response::builder()
@@ -871,8 +893,23 @@ struct ModelResponseItem {
     max_model_len: i64,
 }
 
-async fn models_list_response(state: &AppState) -> anyhow::Result<Response<Body>> {
+async fn models_list_response(
+    state: &AppState,
+    codex_catalog: bool,
+) -> anyhow::Result<Response<Body>> {
     let public_models = db::list_public_models(&state.pool).await?;
+    if codex_catalog {
+        let body = serde_json::json!({
+            "models": public_models
+                .into_iter()
+                .map(codex_model_catalog_item)
+                .collect::<Vec<Value>>()
+        });
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))?);
+    }
     let body = ModelsResponse {
         object: "list",
         data: public_models
@@ -890,6 +927,66 @@ async fn models_list_response(state: &AppState) -> anyhow::Result<Response<Body>
         .status(StatusCode::OK)
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_string(&body)?))?)
+}
+
+fn wants_codex_models_catalog(query: Option<&str>) -> bool {
+    query
+        .map(|query| {
+            query
+                .split('&')
+                .filter_map(|pair| pair.split_once('=').map(|(key, _)| key).or(Some(pair)))
+                .any(|key| key == "client_version")
+        })
+        .unwrap_or(false)
+}
+
+fn codex_model_catalog_item(model: db::PublicModelSummary) -> Value {
+    let max_model_len = model.max_model_len;
+    serde_json::json!({
+        "slug": model.public_model,
+        "display_name": model.public_model,
+        "description": "Route LLM public model alias",
+        "default_reasoning_level": "low",
+        "supported_reasoning_levels": [{
+            "effort": "low",
+            "description": "Minimal reasoning metadata for custom provider compatibility"
+        }],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 100,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": {
+            "message": ""
+        },
+        "upgrade": Value::Null,
+        "base_instructions": "",
+        "model_messages": {
+            "instructions_template": "",
+            "instructions_variables": {}
+        },
+        "supports_reasoning_summaries": false,
+        "default_reasoning_summary": "none",
+        "support_verbosity": false,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "truncation_policy": {
+            "mode": "tokens",
+            "limit": max_model_len
+        },
+        "supports_parallel_tool_calls": true,
+        "supports_image_detail_original": false,
+        "context_window": max_model_len,
+        "max_context_window": max_model_len,
+        "comp_hash": "route-llm",
+        "effective_context_window_percent": 100,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": false,
+        "use_responses_lite": false,
+    })
 }
 
 fn request_model_from_body(body: &Bytes) -> Option<String> {
@@ -1458,7 +1555,7 @@ mod tests {
             },
         };
 
-        let response = models_list_response(&state).await.unwrap();
+        let response = models_list_response(&state, false).await.unwrap();
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         let llm_model = value["data"]
@@ -1473,6 +1570,68 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    }
+
+    #[tokio::test]
+    async fn public_models_can_return_codex_catalog_shape() {
+        let (pool, path) = proxy_test_pool("codex-models-catalog").await;
+        let upstream = db::upsert_upstream(&pool, "provider", "https://example.test/v1", 10, true)
+            .await
+            .unwrap();
+        let model_id = db::upsert_upstream_model_by_id_with_max_model_len(
+            &pool,
+            upstream,
+            "provider-llm",
+            10,
+            true,
+            &["llm"],
+            Some(262_144),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO model_alias_routes(public_model, upstream_model_id, priority, enabled)
+            VALUES ('llm-model', ?, 10, 1);
+            "#,
+        )
+        .bind(model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState {
+            pool: pool.clone(),
+            client: reqwest::Client::new(),
+            config: crate::server::ProxyConfig {
+                public_prefix: "/v1".to_string(),
+                transient_failure_ttl_secs: 300,
+                auth_failure_ttl_secs: 3600,
+                max_body_bytes: 1024 * 1024,
+                admin: crate::server::AdminConfig {
+                    password_hash: None,
+                    session_token: None,
+                    site_name: "Route LLM".to_string(),
+                    site_description: "Local OpenAI-compatible routing proxy".to_string(),
+                    public_base_url: None,
+                },
+            },
+        };
+
+        let response = models_list_response(&state, true).await.unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let llm_model = value["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "llm-model")
+            .unwrap();
+
+        assert_eq!(llm_model["display_name"], "llm-model");
+        assert_eq!(llm_model["shell_type"], "shell_command");
+        assert_eq!(llm_model["supported_reasoning_levels"][0]["effort"], "low");
+        assert_eq!(llm_model["max_context_window"], 262_144);
+        close_proxy_test_pool(pool, path).await;
     }
 
     #[tokio::test]
@@ -1623,6 +1782,191 @@ mod tests {
         assert_eq!(attempt.get::<String, _>("upstream_body_kind"), "html_like");
 
         upstream_task.abort();
+        close_proxy_test_pool(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn responses_request_with_ignored_tools_reaches_chat_upstream() {
+        let (upstream_base_url, captured_body, upstream_task) = start_json_capture_upstream().await;
+        let (pool, path) = proxy_test_pool("responses-ignored-tools").await;
+        let client_key = "client-secret-ignored-tools";
+        db::upsert_client(&pool, "client", client_key, true)
+            .await
+            .unwrap();
+        let upstream_id = db::upsert_upstream(&pool, "provider", &upstream_base_url, 10, true)
+            .await
+            .unwrap();
+        db::upsert_upstream_key_by_id(&pool, upstream_id, "key", "upstream-secret", 10, true)
+            .await
+            .unwrap();
+        let upstream_model_id = db::upsert_upstream_model_by_id_with_max_model_len(
+            &pool,
+            upstream_id,
+            "provider-llm",
+            10,
+            true,
+            &["llm"],
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO model_alias_routes(public_model, upstream_model_id, priority, enabled)
+            VALUES ('llm-model', ?, 10, 1);
+            "#,
+        )
+        .bind(upstream_model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            client: reqwest::Client::new(),
+            config: crate::server::ProxyConfig {
+                public_prefix: "/v1".to_string(),
+                transient_failure_ttl_secs: 300,
+                auth_failure_ttl_secs: 3600,
+                max_body_bytes: 1024 * 1024,
+                admin: crate::server::AdminConfig {
+                    password_hash: None,
+                    session_token: None,
+                    site_name: "Route LLM".to_string(),
+                    site_description: "Local OpenAI-compatible routing proxy".to_string(),
+                    public_base_url: None,
+                },
+            },
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(AUTHORIZATION, format!("Bearer {client_key}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{
+                    "model":"llm-model",
+                    "input":"hello from codex",
+                    "parallel_tool_calls":true,
+                    "tools":[
+                        {"type":"namespace","name":"mcp"},
+                        {"type":"web_search"},
+                        {"type":"custom","name":"terminal"},
+                        {"type":"image_generation"}
+                    ],
+                    "tool_choice":{"type":"namespace","name":"mcp"}
+                }"#,
+            ))
+            .unwrap();
+
+        let response = proxy_inner(state, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["output_text"], "pong");
+        assert_eq!(value["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(value["tool_choice"]["type"], "namespace");
+
+        let upstream_body = captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(upstream_body["model"], "provider-llm");
+        assert_eq!(upstream_body["messages"][0]["content"], "hello from codex");
+        assert_eq!(upstream_body["parallel_tool_calls"], true);
+        let upstream_tools = upstream_body["tools"].as_array().unwrap();
+        assert_eq!(upstream_tools.len(), 1);
+        assert_eq!(upstream_tools[0]["function"]["name"], "terminal");
+        assert!(upstream_body.get("tool_choice").is_none());
+
+        upstream_task.abort();
+        close_proxy_test_pool(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_model_returns_not_found_without_upstream_attempt() {
+        let (pool, path) = proxy_test_pool("unknown-model-not-found").await;
+        let client_key = "client-secret-unknown-model";
+        db::upsert_client(&pool, "client", client_key, true)
+            .await
+            .unwrap();
+        let upstream_id = db::upsert_upstream(&pool, "provider", "http://127.0.0.1:9/v1", 10, true)
+            .await
+            .unwrap();
+        let upstream_key_id =
+            db::upsert_upstream_key_by_id(&pool, upstream_id, "key", "upstream-secret", 10, true)
+                .await
+                .unwrap();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            client: reqwest::Client::new(),
+            config: crate::server::ProxyConfig {
+                public_prefix: "/v1".to_string(),
+                transient_failure_ttl_secs: 300,
+                auth_failure_ttl_secs: 3600,
+                max_body_bytes: 1024 * 1024,
+                admin: crate::server::AdminConfig {
+                    password_hash: None,
+                    session_token: None,
+                    site_name: "Route LLM".to_string(),
+                    site_description: "Local OpenAI-compatible routing proxy".to_string(),
+                    public_base_url: None,
+                },
+            },
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(AUTHORIZATION, format!("Bearer {client_key}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"unknown-model","messages":[{"role":"user","content":"ping"}]}"#,
+            ))
+            .unwrap();
+
+        let response = proxy_inner(state, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["type"], "model_not_found");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown-model")
+        );
+
+        let audit = sqlx::query(
+            r#"
+            SELECT id, status, outcome, error_class, error_message, attempts, model
+            FROM request_audits
+            ORDER BY id DESC
+            LIMIT 1;
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.get::<i64, _>("status"), 404);
+        assert_eq!(audit.get::<String, _>("outcome"), "model_not_found");
+        assert_eq!(audit.get::<String, _>("error_class"), "model_not_found");
+        assert_eq!(audit.get::<i64, _>("attempts"), 0);
+        assert_eq!(audit.get::<String, _>("model"), "unknown-model");
+
+        let attempt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upstream_attempt_audits;")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempt_count, 0);
+
+        let key = sqlx::query(
+            "SELECT disabled_until, consecutive_failures FROM upstream_keys WHERE id = ?;",
+        )
+        .bind(upstream_key_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(key.get::<Option<i64>, _>("disabled_until").is_none());
+        assert_eq!(key.get::<i64, _>("consecutive_failures"), 0);
+
         close_proxy_test_pool(pool, path).await;
     }
 
@@ -1881,6 +2225,41 @@ data: [DONE]
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}/v1"), handle)
+    }
+
+    async fn start_json_capture_upstream() -> (
+        String,
+        Arc<Mutex<Option<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let captured_body = Arc::new(Mutex::new(None));
+        let handler_captured_body = captured_body.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let captured_body = handler_captured_body.clone();
+                async move {
+                    let value: Value = serde_json::from_slice(&body).unwrap();
+                    {
+                        let mut captured_body = captured_body.lock().unwrap();
+                        *captured_body = Some(value);
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), captured_body, handle)
     }
 
     async fn proxy_test_pool(name: &str) -> (SqlitePool, PathBuf) {

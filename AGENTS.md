@@ -154,9 +154,12 @@ Supported Responses compatibility surface:
 
 - Text input and message-array input.
 - Optional `instructions` as a system message.
-- Function tools and function `tool_choice`.
+- Function tools, custom tools, namespace-scoped client-executed tools, and
+  compatible `tool_choice` values.
 - Function-call outputs through `input` items of type
   `function_call_output`.
+- Custom tool-call outputs through `input` items of type
+  `custom_tool_call_output`.
 - `stream: true` SSE conversion for text deltas and function-call argument
   deltas.
 - `previous_response_id` scoped to the authenticated client.
@@ -204,8 +207,8 @@ Routing behavior:
   model. It should produce no healthy candidates.
 - If the request model is a registered real upstream model, route only to
   providers where that exact model is enabled.
-- If the request model is unknown and not a public alias, keep pass-through
-  behavior for backward compatibility.
+- If the request model is unknown and not a public alias, return
+  `404 model_not_found` without touching upstream providers or key health.
 - Global candidate order is upstream priority, upstream model priority,
   upstream key priority, then stable row ids.
 - Alias route candidate order is alias route priority, upstream key priority,
@@ -292,7 +295,7 @@ Routing tests should cover:
 - client-specific alias route allowlists and disabled route fallback blocking
 - generated client token authentication with multiple tokens per client
 - exact registered model routing
-- unknown model pass-through behavior
+- unknown model `404 model_not_found` behavior
 - request body model rewrite edge cases
 - streaming `stream_options.include_usage` injection and SSE usage parsing
 - `/v1/responses` JSON conversion, SSE event conversion, function tool calls,

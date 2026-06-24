@@ -36,6 +36,7 @@ pub async fn serve(pool: SqlitePool, args: ServeArgs) -> anyhow::Result<()> {
         .bind
         .parse()
         .with_context(|| format!("invalid bind address: {}", args.bind))?;
+    cleanup_runtime_state_best_effort(&pool, &args).await;
     let client = Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_secs))
         .build()?;
@@ -66,6 +67,30 @@ pub async fn serve(pool: SqlitePool, args: ServeArgs) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+async fn cleanup_runtime_state_best_effort(pool: &SqlitePool, args: &ServeArgs) {
+    match db::cleanup_runtime_state(
+        pool,
+        args.audit_retention_days,
+        args.response_state_retention_days,
+    )
+    .await
+    {
+        Ok(summary)
+            if summary.request_audits_deleted > 0 || summary.response_states_deleted > 0 =>
+        {
+            tracing::info!(
+                request_audits_deleted = summary.request_audits_deleted,
+                response_states_deleted = summary.response_states_deleted,
+                "cleaned expired route-llm runtime state"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to clean expired route-llm runtime state");
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -197,6 +222,8 @@ mod tests {
             transient_failure_ttl_secs: 300,
             auth_failure_ttl_secs: 3600,
             max_body_bytes: 32 * 1024 * 1024,
+            audit_retention_days: crate::cli::DEFAULT_AUDIT_RETENTION_DAYS,
+            response_state_retention_days: crate::cli::DEFAULT_RESPONSE_STATE_RETENTION_DAYS,
             admin_password: None,
             admin_session_secret: None,
             admin_site_name: "Route LLM".to_string(),

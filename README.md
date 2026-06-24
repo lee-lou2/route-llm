@@ -14,7 +14,7 @@ responses in audit rows.
 ## Features
 
 - OpenAI-compatible `/v1/...` proxying for chat, completions, embeddings,
-  image, audio, and other pass-through paths.
+  image, audio, and other supported paths.
 - Responses API compatibility for chat-completions upstreams, including
   `input`, `instructions`, function `tools`, `tool_choice`,
   `previous_response_id`, `output`, `output_text`, `usage`, and streaming SSE
@@ -104,13 +104,19 @@ router:
 - resolves the requested public alias or real upstream model with the normal
   client-aware routing rules;
 - converts Responses `input` and optional `instructions` into chat messages;
-- maps function `tools` and `tool_choice` into Chat Completions tool fields;
+- maps function `tools`, custom tools, namespace-scoped tools, and compatible
+  `tool_choice` values into Chat Completions tool fields;
+- keeps OpenAI-hosted built-in tool definitions such as `web_search` and
+  `image_generation` as no-op Responses metadata when using the chat adapter;
 - forwards the request to the selected upstream's `/chat/completions` endpoint;
 - converts JSON responses back into Responses objects with `output`,
   `output_text`, and `usage`;
+- converts JSON and streaming tool calls back into Responses `function_call` or
+  `custom_tool_call` output items, including namespace metadata;
 - converts streaming chat deltas into Responses SSE events such as
   `response.created`, `response.output_text.delta`,
-  `response.function_call_arguments.delta`, and `response.completed`.
+  `response.function_call_arguments.delta`,
+  `response.custom_tool_call_input.delta`, and `response.completed`.
 
 If a successful upstream chat response cannot be converted back into Responses
 JSON, the request fails as `response_conversion_error` without disabling the
@@ -125,9 +131,11 @@ SQLite and replaying the prior chat message history for the same client. That
 state can include user inputs, assistant outputs, and function-call metadata, so
 the configured SQLite database must be treated as private runtime state.
 
-The compatibility layer is intentionally limited to text and function-tool
-workflows. It does not implement OpenAI-hosted built-in tools such as hosted web
-search or file search.
+The compatibility layer is intentionally limited to text and client-executed
+tool-call workflows. The router translates function, custom, and namespace tool
+calls so compatible clients can execute them, but the router does not execute
+tools itself. It does not implement OpenAI-hosted built-in tools such as hosted
+web search or file search.
 
 ## Admin UI
 
@@ -187,6 +195,8 @@ Repeat the same `add-upstream`, `add-key`, `add-model-alias`, and
 | `ROUTE_LLM_TRANSIENT_FAILURE_TTL_SECS` | `300` | retry cache TTL for transient upstream failures |
 | `ROUTE_LLM_AUTH_FAILURE_TTL_SECS` | `3600` | retry cache TTL for upstream auth failures |
 | `ROUTE_LLM_MAX_BODY_BYTES` | `33554432` | maximum request body accepted by the proxy |
+| `ROUTE_LLM_AUDIT_RETENTION_DAYS` | `30` | delete request audit rows older than this on startup; set `0` to disable |
+| `ROUTE_LLM_RESPONSE_STATE_RETENTION_DAYS` | `7` | delete Responses compatibility state older than this on startup; set `0` to disable |
 | `ROUTE_LLM_ADMIN_PASSWORD` | unset | enables `/admin` when set; legacy `API_ROUTER_ADMIN_PASSWORD` is accepted as a fallback |
 | `ROUTE_LLM_ADMIN_SESSION_SECRET` | derived from password | optional stable cookie-signing secret; legacy `API_ROUTER_ADMIN_SESSION_SECRET` is accepted as a fallback |
 | `ROUTE_LLM_ADMIN_SITE_NAME` | `Route LLM` | admin UI display name |
@@ -207,8 +217,8 @@ client-specific routes for that client and alias. If none exist, it checks
 default alias routes. If no default alias route exists, it falls back to enabled
 upstream models that support the alias capability. If the requested model is a
 registered real upstream model, the router routes only to providers where that
-exact model is enabled. Unknown models keep backward-compatible pass-through
-behavior.
+exact model is enabled. Unknown models return `404 model_not_found` without
+touching upstream providers or their key health.
 
 ## SQLite And Secrets
 
@@ -228,6 +238,11 @@ Treat these files as secret runtime state:
 They are ignored by git and excluded from Cargo packaging. Do not attach them to
 public issues.
 
+If you run the router under launchd or another supervisor that writes
+`logs/api-router.out.log` and `logs/api-router.err.log`, install a local log
+rotation rule based on `docs/newsyslog.route-llm.conf` and replace the example
+checkout path before enabling it.
+
 Audit rows intentionally do not store request bodies, response bodies, raw
 authorization headers, raw API keys, raw user agents, raw query strings, or
 upstream base URLs. They store ids, names, statuses, sizes, timings, date
@@ -237,7 +252,9 @@ diagnostics for attempts.
 When `/v1/responses` uses `previous_response_id`, `response_states` stores the
 conversation state required to resume the response. Unlike audit rows, this
 state may include prompts, assistant output, and function-call arguments. Treat
-it with the same care as the SQLite key material.
+it with the same care as the SQLite key material. On startup, the router deletes
+expired `request_audits` and `response_states` according to the retention
+configuration above.
 
 ## Project Structure
 

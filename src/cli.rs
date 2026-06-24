@@ -1,5 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 
+pub const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 30;
+pub const DEFAULT_RESPONSE_STATE_RETENTION_DAYS: i64 = 7;
+
 #[derive(Debug, Parser)]
 #[command(name = "route-llm")]
 #[command(about = "OpenAI-compatible API key routing proxy")]
@@ -57,6 +60,20 @@ pub struct ServeArgs {
     #[arg(long, env = "ROUTE_LLM_MAX_BODY_BYTES", default_value_t = 32 * 1024 * 1024)]
     pub max_body_bytes: usize,
 
+    #[arg(
+        long,
+        env = "ROUTE_LLM_AUDIT_RETENTION_DAYS",
+        default_value_t = DEFAULT_AUDIT_RETENTION_DAYS
+    )]
+    pub audit_retention_days: i64,
+
+    #[arg(
+        long,
+        env = "ROUTE_LLM_RESPONSE_STATE_RETENTION_DAYS",
+        default_value_t = DEFAULT_RESPONSE_STATE_RETENTION_DAYS
+    )]
+    pub response_state_retention_days: i64,
+
     #[arg(long, env = "ROUTE_LLM_ADMIN_PASSWORD")]
     pub admin_password: Option<String>,
 
@@ -87,6 +104,26 @@ pub struct AddClientArgs {
 
     #[arg(long, default_value_t = true)]
     pub enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn serve_defaults_include_runtime_retention_days() {
+        let cli = Cli::parse_from(["route-llm", "serve"]);
+        let Command::Serve(args) = cli.command else {
+            panic!("serve command should parse");
+        };
+
+        assert_eq!(args.audit_retention_days, DEFAULT_AUDIT_RETENTION_DAYS);
+        assert_eq!(
+            args.response_state_retention_days,
+            DEFAULT_RESPONSE_STATE_RETENTION_DAYS
+        );
+    }
 }
 
 #[derive(Debug, Args)]

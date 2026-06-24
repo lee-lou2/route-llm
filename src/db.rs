@@ -795,11 +795,17 @@ pub async fn candidates_for_client_request_model(
     }
 
     let exact_candidates = candidates_for_exact_model(pool, requested_model).await?;
-    if exact_candidates.is_empty() {
-        active_candidates(pool).await
-    } else {
-        Ok(exact_candidates)
+    Ok(exact_candidates)
+}
+
+pub async fn is_registered_request_model(
+    pool: &SqlitePool,
+    requested_model: &str,
+) -> anyhow::Result<bool> {
+    if resolve_model_alias(pool, requested_model).await?.is_some() {
+        return Ok(true);
     }
+    registered_upstream_model_exists(pool, requested_model).await
 }
 
 pub async fn get_response_state(
@@ -1142,6 +1148,20 @@ async fn candidates_for_exact_model(
     Ok(rows.into_iter().map(candidate_from_row).collect())
 }
 
+async fn registered_upstream_model_exists(pool: &SqlitePool, model: &str) -> anyhow::Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM upstream_models
+        WHERE model = ?;
+        "#,
+    )
+    .bind(model)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
 fn candidate_from_row(row: sqlx::sqlite::SqliteRow) -> Candidate {
     Candidate {
         upstream_id: row.get("upstream_id"),
@@ -1316,6 +1336,106 @@ pub async fn update_request_audit_usage(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn update_request_audit_stream_error(
+    pool: &SqlitePool,
+    request_audit_id: i64,
+    error_class: &str,
+    error_message: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE request_audits
+        SET
+            outcome = 'response_stream_error',
+            error_class = ?,
+            error_message = ?
+        WHERE id = ?;
+        "#,
+    )
+    .bind(error_class)
+    .bind(truncate_error(error_message))
+    .bind(request_audit_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeCleanupSummary {
+    pub request_audits_deleted: u64,
+    pub response_states_deleted: u64,
+}
+
+pub async fn cleanup_runtime_state(
+    pool: &SqlitePool,
+    audit_retention_days: i64,
+    response_state_retention_days: i64,
+) -> anyhow::Result<RuntimeCleanupSummary> {
+    let now = now_epoch();
+    cleanup_runtime_state_for_cutoffs(
+        pool,
+        retention_cutoff(now, audit_retention_days),
+        retention_cutoff(now, response_state_retention_days),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn cleanup_runtime_state_before(
+    pool: &SqlitePool,
+    request_audit_cutoff: i64,
+    response_state_cutoff: i64,
+) -> anyhow::Result<RuntimeCleanupSummary> {
+    cleanup_runtime_state_for_cutoffs(
+        pool,
+        Some(request_audit_cutoff),
+        Some(response_state_cutoff),
+    )
+    .await
+}
+
+async fn cleanup_runtime_state_for_cutoffs(
+    pool: &SqlitePool,
+    request_audit_cutoff: Option<i64>,
+    response_state_cutoff: Option<i64>,
+) -> anyhow::Result<RuntimeCleanupSummary> {
+    let request_audits_deleted = match request_audit_cutoff {
+        Some(cutoff) => delete_request_audits_before(pool, cutoff).await?,
+        None => 0,
+    };
+    let response_states_deleted = match response_state_cutoff {
+        Some(cutoff) => delete_response_states_before(pool, cutoff).await?,
+        None => 0,
+    };
+    Ok(RuntimeCleanupSummary {
+        request_audits_deleted,
+        response_states_deleted,
+    })
+}
+
+fn retention_cutoff(now: i64, retention_days: i64) -> Option<i64> {
+    if retention_days <= 0 {
+        return None;
+    }
+    Some(now.saturating_sub(retention_days.saturating_mul(86_400)))
+}
+
+async fn delete_request_audits_before(pool: &SqlitePool, cutoff: i64) -> anyhow::Result<u64> {
+    let result = sqlx::query("DELETE FROM request_audits WHERE completed_at < ?;")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+async fn delete_response_states_before(pool: &SqlitePool, cutoff: i64) -> anyhow::Result<u64> {
+    let result = sqlx::query("DELETE FROM response_states WHERE created_at < ?;")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn mark_key_success(pool: &SqlitePool, key_id: i64) -> anyhow::Result<()> {
@@ -2781,7 +2901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_model_falls_back_to_active_key_order_without_rewrite() {
+    async fn unknown_model_does_not_fall_back_to_active_keys() {
         let (pool, path) = test_pool("unknown-model").await;
         add_provider(&pool, "first", 10, "first-key", 10).await;
         add_provider(&pool, "second", 20, "second-key", 10).await;
@@ -2790,9 +2910,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].upstream_name, "first");
-        assert_eq!(candidates[0].resolved_model, None);
+        assert!(candidates.is_empty());
         close_and_remove(pool, path).await;
     }
 
@@ -3487,6 +3605,103 @@ mod tests {
             Some("기본 토큰")
         );
 
+        close_and_remove(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_cleanup_removes_expired_audits_attempts_and_response_states() {
+        let (pool, path) = test_pool("runtime-cleanup").await;
+        let upstream_id = add_provider(&pool, "provider", 10, "key", 10).await;
+        let upstream_key_id = key_id(&pool, "key").await;
+        let old_epoch = 1_700_000_000;
+        let fresh_epoch = old_epoch + 10 * 86_400;
+        let mut old_audit =
+            request_audit_for_path("/v1/chat/completions", "chat_completions", old_epoch);
+        old_audit.upstream_id = Some(upstream_id);
+        old_audit.upstream_name = Some("provider".to_string());
+        old_audit.upstream_key_id = Some(upstream_key_id);
+        old_audit.upstream_key_name = Some("key".to_string());
+        old_audit.attempts = 1;
+        let old_attempt = AttemptAudit {
+            attempt_index: 1,
+            upstream_id,
+            upstream_name: "provider".to_string(),
+            upstream_key_id,
+            upstream_key_name: "key".to_string(),
+            status: Some(200),
+            outcome: "success".to_string(),
+            retriable: false,
+            duration_ms: 10,
+            retry_after_secs: None,
+            disabled_until: None,
+            error_class: None,
+            error_message: None,
+            upstream_content_type: None,
+            upstream_body_bytes: None,
+            upstream_body_hash: None,
+            upstream_body_kind: None,
+        };
+        let old_audit_id = insert_request_audit(&pool, &old_audit, &[old_attempt])
+            .await
+            .unwrap();
+        let fresh_audit = request_audit_for_path("/v1/responses", "responses", fresh_epoch);
+        insert_request_audit(&pool, &fresh_audit, &[])
+            .await
+            .unwrap();
+
+        for (id, created_at) in [("resp_old", old_epoch), ("resp_fresh", fresh_epoch)] {
+            insert_response_state(
+                &pool,
+                &ResponseState {
+                    id: id.to_string(),
+                    previous_response_id: None,
+                    client_id: None,
+                    model: "llm-model".to_string(),
+                    chat_messages_json: "[]".to_string(),
+                    output_json: "[]".to_string(),
+                    output_text: String::new(),
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE response_states SET created_at = ? WHERE id = ?;")
+                .bind(created_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let summary =
+            cleanup_runtime_state_before(&pool, fresh_epoch - 86_400, fresh_epoch - 86_400)
+                .await
+                .unwrap();
+
+        assert_eq!(summary.request_audits_deleted, 1);
+        assert_eq!(summary.response_states_deleted, 1);
+        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM request_audits;")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let attempt_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM upstream_attempt_audits WHERE request_audit_id = ?;",
+        )
+        .bind(old_audit_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let state_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM response_states ORDER BY id;")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(audit_count, 1);
+        assert_eq!(attempt_count, 0);
+        assert_eq!(state_ids, vec!["resp_fresh".to_string()]);
         close_and_remove(pool, path).await;
     }
 }
