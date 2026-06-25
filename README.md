@@ -262,22 +262,22 @@ configuration above.
 src/main.rs          CLI entrypoint and command dispatch
 src/cli.rs           clap argument definitions
 src/server.rs        Axum app state, runtime config, and server startup
-src/http_proxy.rs    OpenAI-compatible proxy, retry, streaming, and audit glue
-src/responses_compat.rs
+src/http_proxy/      OpenAI-compatible proxy handler plus focused proxy helpers
+src/responses_compat/
                      Responses-to-chat compatibility adapter and SSE mapping
-src/db.rs            routing queries, admin summaries, audits, and DB mutations
-src/db/models.rs     shared data structs and constants
-src/db/schema.rs     SQLite connection setup, migrations, indexes, seed aliases
-src/admin_ui.rs      admin routes, form handlers, and HTML rendering
-src/admin_ui/        admin form, page shell, style/script helpers
+src/db/              SQLite schema, routing, audits, admin summaries, mutations
+src/admin_ui/        admin routes, form handlers, auth, rendering, UI helpers
 src/assets.rs        public favicon, manifest, robots, and Open Graph assets
 assets/              embedded admin CSS, JS, and static images
+docs/architecture.md module ownership map for future changes
 ```
 
-The project currently keeps SQL close to the functions that own each behavior.
-When adding broad DB behavior, prefer splitting cohesive modules such as
-`db/routing.rs`, `db/audit.rs`, or `db/admin_stats.rs` rather than growing
-unrelated sections in one place.
+Keep new behavior close to the module that owns it. `src/db/routing.rs` owns
+candidate selection, `src/http_proxy/request_body.rs` owns upstream request body
+rewrites, `src/responses_compat/stream.rs` owns Responses SSE conversion, and
+`src/admin_ui/actions.rs` owns admin form handlers. See
+`docs/architecture.md` before adding broad routing, audit, Responses, or admin
+UI behavior.
 
 ## Development
 

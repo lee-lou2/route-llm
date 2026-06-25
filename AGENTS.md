@@ -108,6 +108,12 @@ provider-specific bootstrap paths unless the user explicitly asks for them.
 - Admin writes must go through SQLite and take effect on the next request
   without process restart. Do not add in-memory route caches unless they have
   explicit invalidation.
+- Keep module ownership narrow. Add new routing SQL under `src/db/routing.rs`,
+  request audit writes under `src/db/audit.rs`, admin statistics under
+  `src/db/admin_stats.rs`, proxy body rewriting under
+  `src/http_proxy/request_body.rs`, Responses SSE conversion under
+  `src/responses_compat/stream.rs`, and admin form handling under
+  `src/admin_ui/actions.rs`.
 - Keep direct dependencies minimal. Remove unused crate dependencies after
   confirming `cargo test` and `cargo clippy -- -D warnings` still pass.
 
@@ -118,15 +124,21 @@ model-provider support, streaming event shape, tools, or `previous_response_id`.
 
 Primary files:
 
-- `src/http_proxy.rs`: request authentication, routing candidate selection,
-  upstream retry behavior, audit writes, and the decision to route
+- `src/http_proxy/mod.rs`: request authentication, routing candidate selection,
+  upstream retry behavior, and the decision to route
   `POST /v1/responses` to the selected upstream `/chat/completions` path.
-- `src/responses_compat.rs`: Responses request normalization, Chat
+- `src/http_proxy/audit.rs`, `src/http_proxy/request_body.rs`, and
+  `src/http_proxy/stream.rs`: proxy audit construction, model rewrite/body
+  shaping, and streaming usage capture.
+- `src/responses_compat/mod.rs`: Responses request normalization and Chat
   Completions request construction, JSON response conversion, SSE event
   conversion, function tool-call mapping, and `previous_response_id` replay
   preparation.
-- `src/db/schema.rs`, `src/db.rs`, and `src/db/models.rs`: `response_states`
-  migration and state read/write helpers.
+- `src/responses_compat/json_response.rs`, `src/responses_compat/stream.rs`,
+  and `src/responses_compat/tools.rs`: JSON conversion, SSE conversion, and
+  tool-call mapping.
+- `src/db/schema.rs`, `src/db/response_state.rs`, and `src/db/models.rs`:
+  `response_states` migration and state read/write helpers.
 
 Data flow:
 
